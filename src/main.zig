@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     var topp: f32 = 0.9; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     var steps: u32 = 256; // number of steps to run for
 
-    var prompt: []const u8 = &.{};
+    var prompt: ?[]const u8 = null;
     var seed: u64 = 0; 
     var mode: []const u8 = "generate"; // generate|chat
 
@@ -167,14 +167,15 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "generate")) {
         try generate(io, arena, &transformer, &tokenizer, &sampler, prompt, steps);
     } else if (std.mem.eql(u8, mode, "chat")) {
-
+        try chat(io, arena, &transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else {
         try error_usage(io);
     }
 }
 
-fn generate(io: std.Io, alloc: Allocator, transformer: *Transformer, tokenizer: *Tokenizer, sampler: *Sampler, prompt: []const u8, steps: u32) !void {
+fn generate(io: std.Io, alloc: Allocator, transformer: *Transformer, tokenizer: *Tokenizer, sampler: *Sampler, prompt_optional: ?[]const u8, steps: u32) !void {
     // encode the (string) prompt into token sequence
+    const prompt = if (prompt_optional) |p| p else &.{};
     const tokens_buffer = try alloc.alloc(i32, prompt.len+3);
     const prompt_tokens = try encode(alloc, tokenizer, prompt, true, false, tokens_buffer);
     if (prompt_tokens.len < 1) {
@@ -224,9 +225,114 @@ fn generate(io: std.Io, alloc: Allocator, transformer: *Transformer, tokenizer: 
         const endf: f64 = @floatFromInt(end);
         std.debug.print("achived tok/s: {}\n", .{(posf - 1) / (endf-startf)*1000});
     }
+}
 
-    // Prompt tokens are never freed but since the program exists I think it's fine, I don't think this will work for chat
-    // mode though
+fn chat(io: std.Io, alloc: Allocator, transformer: *Transformer, tokenizer: *Tokenizer, sampler: *Sampler, cli_user_prompt: ?[]const u8, cli_system_prompt: ?[]const u8, steps: u32) !void {
+    // buffer for reading the system prompt and user prompt from stdin
+    var system_prompt_buff: [512]u8 = undefined;
+    var system_prompt: []const u8 = undefined;
+    var user_prompt_buff: [512]u8 = undefined;
+    var user_prompt: []const u8 = undefined;
+    var rendered_prompt_buff: [1152]u8 = undefined;
+    var rendered_prompt: []const u8 = undefined;
+    const tokens_buffer = try alloc.alloc(i32, 1152);
+    var prompt_tokens: []i32 = undefined; 
+    var user_idx: usize = 0;
+
+    // Set up stdout
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    // Set up stdin
+    var stdin_buff: [512]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buff);
+    const stdin = &stdin_reader.interface;
+
+    // start the main loop
+    var user_turn: bool = true; // user starts
+    var next: i32 = undefined; // will store the next tokein in the sequence
+    var token: i32 = undefined; // stores the current token to feed into the transformer
+    var pos: usize = 0; // position in the sequence
+
+    while (pos < steps) {
+        // when it is the user's turn to contribute tokens to the dialog...
+        if (user_turn) {
+            // get the (optional) system prompt at position 0
+            if (pos == 0) {
+                // at position 0, the user can also contribute a system prompt
+                if (cli_system_prompt) |cli_prompt| {
+                    system_prompt = cli_prompt;
+                } else {
+                    // sytem prompt was not passed int, attempt to get it from stdin
+                    try stdout.writeAll("Enter system prompt (optional): ");
+                    try stdout.flush();
+                    const line = try stdin.takeDelimiterExclusive('\n');
+                    @memcpy(system_prompt_buff[0..line.len], line);
+                    system_prompt = system_prompt_buff[0..line.len];
+                    stdin.toss(1); // toss the '\n' char
+                }
+            }
+
+            // get the user prompt 
+            if (pos == 0 and  cli_user_prompt != null) {
+                // user prompt for position 0 was passed in, use it
+                user_prompt = cli_user_prompt.?;
+            } else {
+                // otherwise get user prompt form stdin
+                try stdout.writeAll("User: ");
+                try stdout.flush();
+                const line = try stdin.takeDelimiterExclusive('\n');
+                @memcpy(user_prompt_buff[0..line.len], line);
+                user_prompt = user_prompt_buff[0..line.len];
+                stdin.toss(1);
+            }
+
+            // render user/system prompts into the Llama 2 Chat schema
+            if (pos == 0 and system_prompt.len > 0) {
+                rendered_prompt = try std.fmt.bufPrint(&rendered_prompt_buff,
+                    "[INST] <<SYS>>\n{s}\n<</SYS>>\n\n{s} [/INST]", .{system_prompt, user_prompt});
+            } else {
+                rendered_prompt = try std.fmt.bufPrint(&rendered_prompt_buff, "[INST] {s} [/INST]", .{user_prompt});
+            }
+
+            // encode the rendered text
+            prompt_tokens = try encode(alloc, tokenizer, rendered_prompt, true, false, tokens_buffer);
+            user_idx = 0; // reset the user index
+            user_turn = false;
+            try stdout.writeAll("Assistant: ");
+            try stdout.flush();
+        }
+
+        // determine the token to pass into the transformer next
+        if (user_idx < prompt_tokens.len and next != 2 and !user_turn) {
+            // if we are still processing the input prompt, force the next prompt token
+            token = prompt_tokens[user_idx];
+            user_idx += 1;
+        } else {
+            // otherwise use the next token sampled from the previous turn
+            token = next;
+        }
+        // EOS (=2) token ends the Assistant turn
+        if (token == 2) user_turn = true;
+
+        // Forward the transformer to get logits for the next token
+        const logits = forward(transformer, token, pos);
+        next = sample(sampler, logits);
+        pos += 1;
+
+        if (user_idx >= prompt_tokens.len and next != 2) {
+            // The assistant is respoinding, so print its output
+            const piece = decode(tokenizer, token, next);
+            safe_print(piece); // skips unsafe bytes
+        }
+
+        if (next == 2) {
+            try stdout.writeAll("\n");
+            try stdout.flush();
+        }
+    }
+    try stdout.writeAll("\n");
+    try stdout.flush();
 }
 
 fn forward(transformer: *Transformer, token: i32, pos: usize) []f32 {
@@ -582,6 +688,7 @@ fn build_sampler(alloc: Allocator, vocab_size: i32, temperature: f32, topp: f32,
     };
 }
 
+var encode_str_buffer: ?[]u8 = undefined;
 fn encode(alloc: Allocator, t: *Tokenizer, text: []const u8, bos: bool, eos: bool, tokens: []i32) ![]i32 {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
@@ -632,9 +739,12 @@ fn encode(alloc: Allocator, t: *Tokenizer, text: []const u8, bos: bool, eos: boo
         }
     }
 
-    // create a temporary buffer that will store merge candidates of always two consecutive tokens
+    // create a buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +2 for UTF8 (in case max_token_length is 1)
-    const str_buffer = try alloc.alloc(u8, @intCast(t.max_token_length*2 + 2));
+    // reused for each encoding call, not thread safe
+    if (encode_str_buffer == null) {
+        encode_str_buffer = try alloc.alloc(u8, @intCast(t.max_token_length*2 + 2));
+    }
 
     // merge the best consecutive pair each iteration, according to the scores in vocab_scores
     while (true) {
@@ -647,7 +757,7 @@ fn encode(alloc: Allocator, t: *Tokenizer, text: []const u8, bos: bool, eos: boo
             const curr = tokens[i];
             const next = tokens[i+1];
             // const merged = try std.fmt.bufPrint(str_buffer, "{s}{s}", .{t.vocab[@intCast(tokens[i])], t.vocab[@intCast(tokens[i+1])]});
-            const merged = try std.fmt.bufPrint(str_buffer, "{s}{s}", .{t.vocab[@intCast(curr)], t.vocab[@intCast(next)]});
+            const merged = try std.fmt.bufPrint(encode_str_buffer.?, "{s}{s}", .{t.vocab[@intCast(curr)], t.vocab[@intCast(next)]});
             const id = str_lookup(merged, t.sorted_vocab.?);
             if (id != null and t.vocab_scores[@intCast(id.?)] > best_score) {
                 // this merge pair exists in vocab! record its score and position
